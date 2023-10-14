@@ -1,20 +1,18 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.17;
+pragma solidity 0.8.17;
 
 interface IToken {
-    function balanceOf(address account) external view returns (uint256);
     function decimals() external view returns (uint256);
-    function approve(address spender, uint value) external;
-    function transfer(address spender, uint value) external;
-    function transferFrom(address from, address to, uint value) external;
+    function transfer(address spender, uint value) external returns(bool);
+    function transferFrom(address from, address to, uint value) external returns(bool);
 }
 
 struct Staking {
     address stakeToken;
     uint256 stakeAmount;
-    uint256 startTime;
-    uint256 lastClaimTime;
-    uint256 closeTime;
+    uint256 startBlockNumber;
+    uint256 lastClaimBlockNumber;
+    uint256 closeBlockNumber;
     uint256 blockRewards;
     address referrer;
     uint256 claimedAmount;
@@ -36,27 +34,19 @@ contract SmarTradeContract {
     mapping(address => uint256[]) public stakingsIdxForUser;
     mapping(address => uint256[]) public stakingsReferIdxForUser;
     
-    uint256 public referrerRate;
-    uint256 public precision;
+    uint256 public constant referrerRate = 1000;
+    uint256 public constant precision = 10000;
 
-    mapping(address => bool) public userInfo;
-    bool public status;
+    uint256 public constant NumBlockPerDay = 7200; // Number of blocks per day
+
+    event Staked(address indexed staker, address tokenAddr, uint256 packageIdx);
+    event UnStaked(address indexed staker, address tokenAddr, uint256 packageIdx);
+    event OwnerSet(address indexed oldOwner, address indexed newOwner);
+    event PackageAdded(uint256 packageIdx, uint256 amount, uint256 period, uint256 rate);
 
     constructor() {
         owner = msg.sender;
-    }
-
-    function initialize() public {
-        require(owner == address(0));
-        owner = msg.sender;
-    }
-
-    function setPrecision(uint256 precision_) public onlyOwner {
-        precision = precision_;
-    }
-
-    function setReferrerRate(uint256 rRate) public onlyOwner {
-        referrerRate = rRate;
+        emit OwnerSet(address(0), owner);
     }
 
     modifier onlyOwner() {
@@ -64,7 +54,15 @@ contract SmarTradeContract {
         _;
     }
 
+    modifier onlyStaker(uint256 stakingIdx) {
+        require(stakingIdx < stakings.length, "Invalid staking index");
+        require(msg.sender == stakings[stakingIdx].staker, "Not staker");
+        _;
+    }
+
     function renewOwner(address newOwner) public onlyOwner {
+        require(newOwner != address(0));
+        emit OwnerSet(owner, newOwner);
         owner = newOwner;
     }
 
@@ -75,16 +73,15 @@ contract SmarTradeContract {
     }
 
     function addPackage(uint256 amount, uint256 dayCount, uint256 rate) public onlyOwner {
-        Package memory package;
-        package.amount = amount;
-        package.period = dayCount * 7200;
-        package.rate = rate;
+        Package memory package = Package(amount, dayCount * NumBlockPerDay, rate);
         packages.push(package);
+        emit PackageAdded(packages.length - 1, amount, dayCount, rate);
     }
 
     function editPackage(uint256 packageIdx, uint256 amount, uint256 dayCount, uint256 rate) public onlyOwner {
+        require(packageIdx < packages.length, "Invalid package index");
         packages[packageIdx].amount = amount;
-        packages[packageIdx].period = dayCount * 7200;
+        packages[packageIdx].period = dayCount * NumBlockPerDay;
         packages[packageIdx].rate = rate;
     }
 
@@ -103,7 +100,7 @@ contract SmarTradeContract {
     function getActiveStakingsCount() public view returns(uint256) {
         uint256 count = 0;
         for(uint256 i = 0; i < stakings.length; i ++) {
-            if(stakings[i].closed == false) {
+            if(!stakings[i].closed) {
                 count ++;
             }
         }
@@ -117,7 +114,7 @@ contract SmarTradeContract {
     function getActiveStakingsAmount() public view returns(uint256) {
         uint256 totalValue = 0;
         for(uint256 i = 0; i < stakings.length; i ++) {
-            if(stakings[i].closed == true) continue;
+            if(stakings[i].closed) continue;
             uint256 pi = stakings[i].packageIdx;
             totalValue += packages[pi].amount;
         }
@@ -125,26 +122,33 @@ contract SmarTradeContract {
     }
 
     function stake(uint256 packageIdx, address tokenAddr, address referrer) public onlyEOA {
-        require(referrer != msg.sender && referrer != address(0), "equal to staker or null");
+        require(referrer != msg.sender && referrer != address(0), "Referrer is equal to staker or null");
+        require(tokenAddr != address(0), "Invalid stake token address");
+        require(packageIdx < packages.length, "Invalid package index");
         Package memory package = packages[packageIdx];
-        Staking memory newStaking;
-        newStaking.stakeToken = tokenAddr;
-        newStaking.stakeAmount = package.amount * (10 ** IToken(tokenAddr).decimals());
-        newStaking.startTime = block.number;
-        newStaking.lastClaimTime = block.number;
-        newStaking.closeTime = block.number + package.period;
-        newStaking.blockRewards = newStaking.stakeAmount * package.rate / precision / 7200;
-        newStaking.referrer = referrer;
-        newStaking.claimedAmount = 0;
-        newStaking.closed = false;
-        newStaking.staker = msg.sender;
-        newStaking.packageIdx = packageIdx;
+        Staking memory newStaking = Staking(
+            tokenAddr,
+            package.amount * (10 ** IToken(tokenAddr).decimals()),
+            block.number,
+            block.number,
+            block.number + package.period,
+            0,
+            referrer,
+            0,
+            false,
+            msg.sender,
+            packageIdx
+        );
+        newStaking.blockRewards = newStaking.stakeAmount * package.rate / precision / NumBlockPerDay;
 
-        IToken(newStaking.stakeToken).transferFrom(newStaking.staker, address(this), newStaking.stakeAmount);
+        bool transferTokenRes = IToken(newStaking.stakeToken).transferFrom(newStaking.staker, address(this), newStaking.stakeAmount);
+        require(transferTokenRes);
 
         stakings.push(newStaking);
         stakingsIdxForUser[msg.sender].push(stakings.length - 1);
         stakingsReferIdxForUser[referrer].push(stakings.length - 1);
+
+        emit Staked(msg.sender, tokenAddr, packageIdx);
     }
 
     function claim() public onlyEOA {
@@ -154,66 +158,68 @@ contract SmarTradeContract {
         }
     }
 
-    function claimEachStaking(uint256 stakingId) public onlyEOA {
+    function claimEachStaking(uint256 stakingId) public onlyEOA onlyStaker(stakingId) {
         Staking storage staking = stakings[stakingId];
-        require(staking.staker == msg.sender, "not staker");
+        
         if(staking.closed) return;
 
         uint256 rewards = calcRewards(stakingId);
 
-        if(staking.closeTime <= block.number) {
+        if(staking.closeBlockNumber <= block.number) {
             rewards += staking.stakeAmount;
             staking.closed = true;
         }
 
-        staking.lastClaimTime = block.number;
+        staking.lastClaimBlockNumber = block.number;
         staking.claimedAmount = staking.claimedAmount + rewards;
 
-        IToken(staking.stakeToken).transfer(staking.staker, rewards);
+        bool claimRes = IToken(staking.stakeToken).transfer(staking.staker, rewards);
+        require(claimRes);
         if(staking.closed) {
-            IToken(staking.stakeToken).transfer(staking.referrer, (staking.claimedAmount - staking.stakeAmount) * referrerRate / precision);
+            bool referRewardRes = IToken(staking.stakeToken).transfer(staking.referrer, (staking.claimedAmount - staking.stakeAmount) * referrerRate / precision);
+            require(referRewardRes);
         }
     }
 
-    function unStake(uint256 stakingId) public onlyEOA {
+    function unStake(uint256 stakingId) public onlyEOA onlyStaker(stakingId) {
         Staking storage staking = stakings[stakingId];
-        require(staking.staker == msg.sender, "not staker");
-        require(staking.closed == false, "already closed");
-        if(staking.closeTime < block.number) claimEachStaking(stakingId);
+        
+        require(!staking.closed, "already closed");
+        if(staking.closeBlockNumber < block.number) claimEachStaking(stakingId);
 
         if(staking.claimedAmount < staking.stakeAmount) {
-            IToken(staking.stakeToken).transfer(staking.staker, staking.stakeAmount - staking.claimedAmount);
+            bool unstakeRes = IToken(staking.stakeToken).transfer(staking.staker, staking.stakeAmount - staking.claimedAmount);
+            require(unstakeRes);
             staking.claimedAmount = staking.stakeAmount;
         }
 
         staking.closed = true;
-        staking.lastClaimTime = block.number;
+        staking.lastClaimBlockNumber = block.number;
+        
+        emit Staked(msg.sender, staking.stakeToken, staking.packageIdx);
     }
 
     function calcRewards(uint256 stakeIdx) public view returns(uint256) {
-        uint256 start = stakings[stakeIdx].lastClaimTime;
-        uint256 end = stakings[stakeIdx].closeTime < block.number ? stakings[stakeIdx].closeTime : block.number;
+        uint256 start = stakings[stakeIdx].lastClaimBlockNumber;
+        uint256 end = stakings[stakeIdx].closeBlockNumber < block.number ? stakings[stakeIdx].closeBlockNumber : block.number;
         if(end <= start) return 0;
         uint256 rewards =  stakings[stakeIdx].blockRewards * (end - start);
-        rewards = rewards + rewards * (end - start) / (stakings[stakeIdx].closeTime - start) * 4 / 11;
+        rewards = rewards + rewards * (end - start) * 4 / (stakings[stakeIdx].closeBlockNumber - start) / 11;
         return rewards;
     }
 
     function depositToVault(address token, address to, uint256 amount) public onlyOwner {
-        IToken(token).transfer(to, amount);
+        bool depositRes = IToken(token).transfer(to, amount);
+        require(depositRes);
     }
     
     modifier onlyEOA() {
-        require(isContract(msg.sender) == false, "called by contract");
+        require(!isContract(msg.sender), "called by contract");
         _;
     }
 
-    function isContract(address _addr) private view returns (bool){
-        uint32 size;
-        assembly {
-            size := extcodesize(_addr)
-        }
-        return (size > 0);
+    function isContract(address _addr) private view returns (bool) {
+        return (_addr.code.length > 0);
     }
 
 }
