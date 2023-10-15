@@ -196,7 +196,7 @@ contract SmarTradeContract {
         staking.closed = true;
         staking.lastClaimBlockNumber = block.number;
         
-        emit Staked(msg.sender, staking.stakeToken, staking.packageIdx);
+        emit UnStaked(msg.sender, staking.stakeToken, staking.packageIdx);
     }
 
     function calcRewards(uint256 stakeIdx) public view returns(uint256) {
